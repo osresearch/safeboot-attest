@@ -25,14 +25,6 @@ cleanup() {
 
 trap cleanup EXIT
 
-# RSA EK NVRAM handle
-EK_HANDLE=0x1c00002
-
-# Expected values for the EK and AK types to ensure that they
-# are created inside a TPM and have the proper policies associated.
-EK_TYPE='fixedtpm|fixedparent|sensitivedataorigin|adminwithpolicy|restricted|decrypt'
-AK_TYPE='fixedtpm|stclear|fixedparent|sensitivedataorigin|userwithauth|restricted|sign'
-
 tpm2_flushall() {
 	tpm2 flushcontext \
 		--transient-object \
@@ -68,6 +60,7 @@ tpm2_secret_session()
 
 quote()
 {
+	QUOTE_FILES=()
 	QUOTE_PCRS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"
 
 	tpm2_flushall
@@ -82,7 +75,7 @@ quote()
 		--key-algorithm "rsa" \
 		--public "$TMP/ek.pub" \
 	|| die "tpm2_createek: unable to retrieve endorsement key"
-	echo ek.pub
+	QUOTE_FILES+=("ek.pub")
 
 	# this public key is generated each time and includes the
 	# `stclear` attribute so that it can not be persistent
@@ -130,15 +123,15 @@ quote()
 		--output "$TMP/ak.pub" \
 		--format "tpmt" \
 	|| die "tpm2_readpublic: unable to display info"
-	echo ak.pub
+	QUOTE_FILES+=("ak.pub")
 
 	tpm2 flushcontext --transient-object
 
 	QUOTE_TIME="$(date '+%s')"
-	QUOTE_NONCE="${1:-$(printf '%08x' "$QUOTE_TIME")}"
+	QUOTE_NONCE="$(printf '%08x' "$QUOTE_TIME")"
 	echo -n "$QUOTE_NONCE" > "$TMP/nonce" \
 	|| die "$TMP/nonce: unable to create"
-	echo nonce
+	QUOTE_FILES+=("nonce")
 
 	# get a quote using this attestation key
 	tpm2_flushall ""
@@ -151,7 +144,9 @@ quote()
 		--signature "$TMP/sig" \
 		--pcr "$TMP/pcr" \
 	|| die "tpm2_quote: unable to generate quote"
-	echo quote sig pcr
+	QUOTE_FILES+=("quote")
+	QUOTE_FILES+=("sig")
+	QUOTE_FILES+=("pcr")
 
 	# Include the TPM event log and Linux IMA log if they exists
 	EVENTLOG="/sys/kernel/security/tpm0/binary_bios_measurements"
@@ -162,7 +157,7 @@ quote()
 			"$EVENTLOG" \
 			"$TMP/eventlog" \
 		|| die "$EVENTLOG: unable to copy"
-		echo eventlog
+		QUOTE_FILES+=("eventlog")
 	fi
 
 	if [ -r "$IMALOG" ]; then
@@ -170,7 +165,7 @@ quote()
 			"$IMALOG" \
 			"$TMP/imalog" \
 		|| die "$IMALOG: unable to copy"
-		echo imalog
+		QUOTE_FILES+=("imalog")
 	fi
 }
 
@@ -181,15 +176,12 @@ send_quote()
 	shift
 
 	# convert them into form arguments for the curl command
-	FORM_ARGS=()
-
-	warn "attest files: $@"
-	for file in "$@"; do
+	for file in "${QUOTE_FILES[@]}"; do
 		FORM_ARGS+=("--form" "$file=@$TMP/$file")
 	done
 
 	tpm2 checkquote \
-		--qualification "$(cat $TMP/nonce)" \
+		--qualification "$(cat "$TMP/nonce")" \
 		--message "$TMP/quote" \
 		--signature "$TMP/sig" \
 		--pcr "$TMP/pcr" \
@@ -235,8 +227,8 @@ if [ -z "$SERVER" ]; then
 	die "Usage: $0 server-url > secret.bin"
 fi
 
-QUOTE_FILES=$(quote || die "quote failed")
-send_quote "$SERVER" $QUOTE_FILES > "$TMP/credential.bin" || die "curl failed"
+quote || die "quote failed"
+send_quote "$SERVER" > "$TMP/credential.bin" || die "curl failed"
 unseal "$TMP/credential.bin" || die "unseal failed"
 
 exit 0
