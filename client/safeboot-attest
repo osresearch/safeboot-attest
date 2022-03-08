@@ -1,0 +1,242 @@
+#!/bin/bash
+# safeboot-attest: TPM2 Remote Attestation
+#
+# This wraps the low level `tpm2-tools` programs into a fairly turn-key
+# remote attestation system to allow a client to use the TPM2 to prove to
+# a server that the PCRs are in a given state, and to then receive a
+# 32-byte sealed secret that can only be decrypted if the system is still in
+# that state.
+#
+# For more info: https://safeboot.dev/attestation/
+#
+# turn off "expressions don't expand in single quotes"
+# and "can't follow non-constant sources"
+# shellcheck disable=SC2016 disable=SC1090
+set -e -o pipefail
+export LC_ALL=C
+
+die() { echo >&2 "$*" ; exit 1 ; }
+warn() { echo >&2 "$*" ; }
+
+TMP=$(mktemp -d)
+cleanup() {
+	rm -rf "$TMP"
+}
+
+trap cleanup EXIT
+
+# RSA EK NVRAM handle
+EK_HANDLE=0x1c00002
+
+# Expected values for the EK and AK types to ensure that they
+# are created inside a TPM and have the proper policies associated.
+EK_TYPE='fixedtpm|fixedparent|sensitivedataorigin|adminwithpolicy|restricted|decrypt'
+AK_TYPE='fixedtpm|stclear|fixedparent|sensitivedataorigin|userwithauth|restricted|sign'
+
+tpm2_flushall() {
+	tpm2 flushcontext \
+		--transient-object \
+	|| die "tpm2_flushcontext: unable to flush transient handles"
+
+	tpm2 flushcontext \
+		--loaded-session \
+	|| die "tpm2_flushcontext: unable to flush sessions"
+
+	tpm2 flushcontext \
+		--saved-session \
+	|| die "tpm2_flushcontext: unable to flush saved session"
+}
+
+tpm2_secret_session()
+{
+	SESSION="${1:-$TPM/session.ctx}"
+
+	tpm2_flushall
+
+	warn "tpm2: starting secret session $SESSION"
+	tpm2 startauthsession >&2 \
+		--session "$SESSION" \
+		--policy-session  \
+	|| die "tpm2_startauthsession: unable to start authenticated session"
+
+	# context is TPM_RH_ENDORSEMENT because why would you want names?
+	tpm2 policysecret >&2 \
+		--session "$SESSION" \
+		--object-context "endorsement" \
+	|| die "tpm2_policysecret: unable to set context TPM_RH_ENDORSEMENT"
+}
+
+quote()
+{
+	QUOTE_PCRS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"
+
+	tpm2_flushall
+
+	# this key should always be the same
+	# and for stupid tpm2-tools reasons it has to be in the
+	# non-standard TPM2B_PUBLIC format rather than a useful PEM file.
+	warn "tpm2: reading endorsement key"
+	tpm2_flushall
+	tpm2 createek >&2 \
+		--ek-context "$TMP/ek.ctx" \
+		--key-algorithm "rsa" \
+		--public "$TMP/ek.pub" \
+	|| die "tpm2_createek: unable to retrieve endorsement key"
+	echo ek.pub
+
+	# this public key is generated each time and includes the
+	# `stclear` attribute so that it can not be persistent
+	# and it will not be valid after a reboot.
+	#
+	# The much simpler `tpm2_createak` could have been used,
+	# except that it makes persistent attestation keys, which
+	# would allow an attacker to reboot the machine into an
+	# untrusted state and unseal the response from the attestation
+	# server.
+	#
+	# tpm2_createak >&2 \
+	#	--ek-context "$TMP/ek.ctx" \
+	#	--ak-context "ak.ctx" \
+	#	--public "$TMP/ak.pem" \
+	#	--format "pem" \
+	#|| die "tpm2_createak: unable to create attestation key"
+
+	tpm2_secret_session "$TMP/session.ctx"
+
+	warn "tpm2: creating ephemeral attestation key"
+	tpm2 create >&2 \
+		--parent-context "$TMP/ek.ctx" \
+		--parent-auth "session:$TMP/session.ctx" \
+		--key-algorithm "ecc:ecdsa:null" \
+		--attributes "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign|stclear" \
+		--public "$TMP/ak-pub.key" \
+		--private "$TMP/ak-priv.key" \
+	|| die "tpm2_create: unable to create an attestation key"
+
+	# have to start a new secret session to load the attestation key
+	tpm2_secret_session "$TMP/session.ctx"
+	tpm2 load >&2 \
+		--parent-context "$TMP/ek.ctx" \
+		--auth "session:$TMP/session.ctx" \
+		--key-context "$TMP/ak.ctx" \
+		--public "$TMP/ak-pub.key" \
+		--private "$TMP/ak-priv.key" \
+	|| die "tpm2_load: unable to load attestation key"
+
+	# read the public component so that the name can be
+	# computed with sha256
+	tpm2 readpublic >&2 \
+		--object-context "$TMP/ak.ctx" \
+		--output "$TMP/ak.pub" \
+		--format "tpmt" \
+	|| die "tpm2_readpublic: unable to display info"
+	echo ak.pub
+
+	tpm2 flushcontext --transient-object
+
+	QUOTE_TIME="$(date '+%s')"
+	QUOTE_NONCE="${1:-$(printf '%08x' "$QUOTE_TIME")}"
+	echo -n "$QUOTE_NONCE" > "$TMP/nonce" \
+	|| die "$TMP/nonce: unable to create"
+	echo nonce
+
+	# get a quote using this attestation key
+	tpm2_flushall ""
+	warn "tpm2: generating quote $QUOTE_NONCE"
+	tpm2 quote >&2 \
+		--key-context "$TMP/ak.ctx" \
+		--pcr-list "sha256:$QUOTE_PCRS" \
+		--qualification "$QUOTE_NONCE" \
+		--message "$TMP/quote" \
+		--signature "$TMP/sig" \
+		--pcr "$TMP/pcr" \
+	|| die "tpm2_quote: unable to generate quote"
+	echo quote sig pcr
+
+	# Include the TPM event log and Linux IMA log if they exists
+	EVENTLOG="/sys/kernel/security/tpm0/binary_bios_measurements"
+	IMALOG="/sys/kernel/security/ima/ascii_runtime_measurements"
+
+	if [ -r "$EVENTLOG" ]; then
+		cp \
+			"$EVENTLOG" \
+			"$TMP/eventlog" \
+		|| die "$EVENTLOG: unable to copy"
+		echo eventlog
+	fi
+
+	if [ -r "$IMALOG" ]; then
+		cp \
+			"$IMALOG" \
+			"$TMP/imalog" \
+		|| die "$IMALOG: unable to copy"
+		echo imalog
+	fi
+}
+
+
+send_quote()
+{
+	SERVER="$1"
+	shift
+
+	# convert them into form arguments for the curl command
+	FORM_ARGS=()
+
+	warn "attest files: $@"
+	for file in "$@"; do
+		FORM_ARGS+=("--form" "$file=@$TMP/$file")
+	done
+
+	tpm2 checkquote \
+		--qualification "$(cat $TMP/nonce)" \
+		--message "$TMP/quote" \
+		--signature "$TMP/sig" \
+		--pcr "$TMP/pcr" \
+		--public "$TMP/ak.pub" \
+		1>&2 \
+	|| warn "could not verify own quote. uh oh"
+
+	curl \
+		-X POST \
+		--fail \
+		--silent \
+		"${FORM_ARGS[@]}" \
+		"$SERVER" \
+	|| die "attestation failed"
+}
+
+# credential.bin has a sealed secret for us
+# this assumes that the EK and AK are still present in $TMP
+unseal()
+{
+	CREDENTIAL="$1"
+
+	xxd -g1 "$CREDENTIAL"
+
+	tpm2_secret_session "$TMP/session.ctx"
+
+	tpm2 activatecredential \
+		--credentialedkey-context "$TMP/ak.ctx" \
+		--credentialkey-context "$TMP/ek.ctx" \
+		--credentialkey-auth "session:$TMP/session.ctx" \
+		--credential-blob "$CREDENTIAL" \
+		--certinfo-data "$TMP/secret.key" \
+		1>&2 \
+	|| die "tpm2_activatecredential: unable to unseal key"
+
+	cat "$TMP/secret.key"
+	rm -f "$TMP/secret.key"
+}
+
+
+SERVER="$1"
+if [ -z "$SERVER" ]; then
+	die "Usage: $0 server-url > secret.bin"
+fi
+
+QUOTE_FILES=$(quote || die "quote failed")
+send_quote "$SERVER" $QUOTE_FILES > "$TMP/credential.bin" || die "curl failed"
+unseal "$TMP/credential.bin" || die "unseal failed"
+
+exit 0

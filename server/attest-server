@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+
+"""
+Quote and Eventlog validating Attestation Server.
+
+This is a python flask server implementing a single API end-point on /, which
+expects a POST request encoded in conventional form (multipart/form-data) that
+includes a fields for the `quote` over the `pcr` values, the `sig` on the
+quote by the `ak.pub` along with the one-time `nonce` value. Optionally 
+it can include the `eventlog` and `imalog` for more granular decoding of events.
+
+To use from 'curl', you would;
+  curl -X -POST -F quote=@"quote.bin" ... <URL>
+
+The API performs three actions:
+
+* Validates that the Quote is signed by the AK with the provided nonce over the provided PCR values.
+* Validates that the PCR extensions in the Eventlog produce the PCR values in the quote for every quoted PCR.
+
+It then invokes an external handler to verify that the eventlog
+meets the policy requirements, and will return any output from this
+handler to the attesting machine.
+
+"""
+import flask
+from flask import request, abort, send_file
+import subprocess
+import os, sys
+from stat import *
+import tempfile
+import logging
+import yaml
+import hashlib
+from Crypto.Hash import SHA256
+
+
+bindir = os.environ.get('BINDIR')
+if not bindir:
+    bindir = '.'
+
+
+# The flask details;
+
+app = flask.Flask(__name__)
+app.config["DEBUG"] = True
+
+@app.route('/', methods=['GET'])
+def home_get():
+    abort(405)
+
+@app.route('/', methods=['POST'])
+def home_post():
+    # at a minimum there must be:
+    required=('quote', 'sig', 'pcr', 'nonce', 'ak.pub', 'ek.pub')
+
+    for f in required:
+      if f not in request.files:
+          print(f, " not present in form data")
+          abort(403)
+
+    # Create a temporary directory for the quote file, and make it world
+    # readable+executable. (This gets garbage collected after we're done, as do
+    # any files we put in there.) We may priv-sep the python API from the
+    # underlying safeboot routines at some point, by running the latter behind
+    # sudo as another user, so this ensures it would be able to read the quote
+    # file.
+    tf = tempfile.TemporaryDirectory()
+    s = os.stat(tf.name)
+    os.chmod(tf.name, s.st_mode | S_IROTH | S_IXOTH)
+
+    # save the required files into the directory
+    files = {}
+    for f in required:
+      files[f] = request.files[f].read()
+      with open(os.path.join(tf.name, f), "wb") as fd:
+        fd.write(files[f])
+
+    # re-read some of the files since save() makes them no longer available
+    ek_hash = SHA256.new(files["ek.pub"]).hexdigest()
+    ak_hash = SHA256.new(files["ak.pub"]).hexdigest()
+
+    # use the tpm2 checkquote to validate the signature on the quote,
+    # the PCRs in the quote, and the one time nonce used for liveliness
+    # todo: use a signed nonce? timestamp?
+    sub = subprocess.run([
+	"tpm2", "checkquote",
+	"--qualification", files["nonce"],
+	"--message",	os.path.join(tf.name, "quote"),
+	"--signature",	os.path.join(tf.name, "sig"),
+	"--pcr",	os.path.join(tf.name, "pcr"),
+	"--public",	os.path.join(tf.name, "ak.pub"),
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+        abort (403, "INVALID_QUOTE_SIGNATURE")
+
+    # The output contains YAML formatted list of PCRs
+    quote = yaml.safe_load(sub.stdout)
+
+    # verify that the eventlog, if present matches
+    eventlog = {}
+
+    if "eventlog" not in request.files:
+      # todo: allow server configuration for this
+      abort (403, "MISSING_EVENTLOG")
+    else:
+      eventlog_filename = os.path.join(tf.name, "eventlog")
+      request.files["eventlog"].save(eventlog_filename)
+      sub = subprocess.run([ "tpm2", "eventlog", eventlog_filename],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+      )
+      if sub.returncode != 0:
+        abort (403, "INVALID_EVENTLOG")
+
+      eventlog = yaml.safe_load(sub.stdout)
+      if not "pcrs" in eventlog:
+        abort (403, "INVALID_EVENTLOG")
+
+      # validate that the eventlog pcrs match the quote pcrs
+      # note that an attacker might have removed some of the events;
+      # this only checks that the event log entries correspond to
+      # the resulting pcrs, but not that every pcr has eventlog entries.
+      for alg in quote["pcrs"]:
+        quote_pcrs = quote["pcrs"][alg]
+        if not alg in eventlog["pcrs"]:
+          abort (403, "INVALID_EVENTLOG_ALG:" + alg)
+        eventlog_pcrs = eventlog["pcrs"][alg]
+
+        for pcr in quote_pcrs:
+          if not pcr in eventlog_pcrs:
+            # not an error; might have happened *after* the eventlog
+            # was closed by ExitBootServices
+            continue
+          ev = eventlog_pcrs[pcr];
+          qv = quote_pcrs[pcr]
+          if ev != qv:
+            abort (403, "inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
+
+    # the quote, eventlog and PCRS are consistent,
+    print(ek_hash + ": valid quote and eventlog")
+
+    # now ask the verifier to
+    # process the eventlog and decide if the eventlog meets policy for
+    # this ekhash.
+    sub = subprocess.run([
+	bindir + "/attest-verify",
+	"verify",
+	ek_hash,
+	tf.name,
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+        abort (403, "ATTEST_VERIFY FAILED")
+
+    # read the (binary) response from the sub process stdout
+    secret = sub.stdout
+    secret_filename = os.path.join(tf.name, "secret.bin")
+    with open(secret_filename, "wb") as f:
+      f.write(secret)
+
+    # and now seal it with the AK/EK into a credential blob
+    cred_filename = os.path.join(tf.name, "credential.blob")
+    result = subprocess.run([
+	"tpm2", "makecredential",
+	"--tcti", "none",
+	"--secret", secret_filename,
+	"--encryption-key", os.path.join(tf.name, "ek.pub"),
+	"--name", "000b" + ak_hash,
+        "--credential-blob", cred_filename,
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+       return (500, "makecredential failed")
+
+    return send_file(cred_filename)
+
+if __name__ == "__main__":
+    app.run()

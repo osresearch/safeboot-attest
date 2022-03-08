@@ -1,0 +1,4 @@
+#!/bin/sh
+# place holder to just say hello!
+
+echo `date` hello
