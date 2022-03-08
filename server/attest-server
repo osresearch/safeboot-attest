@@ -95,7 +95,8 @@ def home_post():
     )
 
     if sub.returncode != 0:
-        abort (403, "INVALID_QUOTE_SIGNATURE")
+      print(ek_hash + ": invalid quote signature")
+      abort (403, "INVALID_QUOTE_SIGNATURE")
 
     # The output contains YAML formatted list of PCRs
     quote = yaml.safe_load(sub.stdout)
@@ -105,19 +106,25 @@ def home_post():
 
     if "eventlog" not in request.files:
       # todo: allow server configuration for this
+      print(ek_hash + ": missing eventlog")
       abort (403, "MISSING_EVENTLOG")
     else:
       eventlog_filename = os.path.join(tf.name, "eventlog")
       request.files["eventlog"].save(eventlog_filename)
-      sub = subprocess.run([ "tpm2", "eventlog", eventlog_filename],
+      sub = subprocess.run([
+		"tpm2", "eventlog",
+		eventlog_filename,
+      ],
 	stdout=subprocess.PIPE,
 	stderr=sys.stderr,
       )
       if sub.returncode != 0:
+        print(ek_hash + ": invalid eventlog")
         abort (403, "INVALID_EVENTLOG")
 
       eventlog = yaml.safe_load(sub.stdout)
       if not "pcrs" in eventlog:
+        print(ek_hash + ": no PCRs in eventlog?")
         abort (403, "INVALID_EVENTLOG")
 
       # validate that the eventlog pcrs match the quote pcrs
@@ -127,6 +134,7 @@ def home_post():
       for alg in quote["pcrs"]:
         quote_pcrs = quote["pcrs"][alg]
         if not alg in eventlog["pcrs"]:
+          print(ek_hash + ": no " + alg + " PCRs in eventlog?")
           abort (403, "INVALID_EVENTLOG_ALG:" + alg)
         eventlog_pcrs = eventlog["pcrs"][alg]
 
@@ -138,6 +146,7 @@ def home_post():
           ev = eventlog_pcrs[pcr];
           qv = quote_pcrs[pcr]
           if ev != qv:
+            print(ek_hash + ": inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
             abort (403, "inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
 
     # the quote, eventlog and PCRS are consistent,
@@ -157,6 +166,7 @@ def home_post():
     )
 
     if sub.returncode != 0:
+        print(ek_hash + ": attest-verify")
         abort (403, "ATTEST_VERIFY FAILED")
 
     # read the (binary) response from the sub process stdout
@@ -180,7 +190,8 @@ def home_post():
     )
 
     if sub.returncode != 0:
-       return (500, "makecredential failed")
+      print(ek_hash + ": makecredential failed?")
+      return (500, "makecredential failed")
 
     return send_file(cred_filename)
 
