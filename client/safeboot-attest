@@ -18,8 +18,23 @@
 set -e -o pipefail
 export LC_ALL=C
 
-die() { echo >&2 "$*" ; exit 1 ; }
-warn() { echo >&2 "$*" ; }
+die() { echo >&2 "FATAL: $*" ; exit 1 ; }
+
+if [ "$Q" == 1 ]; then
+	info() { true ; }
+	warn() { true ; }
+else
+	warn() { echo >&2 "WARNING: $*" ; }
+	info() { echo >&2 "$*" ; }
+fi
+
+if [ "$V" == 1 ]; then
+	debug() { info "$@" ; }
+	QUIET=""
+else
+	debug() { true ; }
+	QUIET="--quiet"
+fi
 
 TMP=$(mktemp -d)
 cleanup() {
@@ -29,6 +44,8 @@ cleanup() {
 trap cleanup EXIT
 
 tpm2_flushall() {
+	debug "tpm2: flushing contexts"
+
 	tpm2 flushcontext \
 		--transient-object \
 	|| die "tpm2_flushcontext: unable to flush transient handles"
@@ -48,14 +65,17 @@ tpm2_secret_session()
 
 	tpm2_flushall
 
-	warn "tpm2: starting secret session $SESSION"
+	debug "tpm2: starting secret session $SESSION"
+
 	tpm2 startauthsession >&2 \
+		$QUIET \
 		--session "$SESSION" \
 		--policy-session  \
 	|| die "tpm2_startauthsession: unable to start authenticated session"
 
 	# context is TPM_RH_ENDORSEMENT because why would you want names?
 	tpm2 policysecret >&2 \
+		$QUIET \
 		--session "$SESSION" \
 		--object-context "endorsement" \
 	|| die "tpm2_policysecret: unable to set context TPM_RH_ENDORSEMENT"
@@ -68,11 +88,8 @@ quote()
 
 	tpm2_flushall
 
-	# this key should always be the same
-	# and for stupid tpm2-tools reasons it has to be in the
-	# non-standard TPM2B_PUBLIC format rather than a useful PEM file.
-	warn "tpm2: reading endorsement key"
-	tpm2_flushall
+	# read the key in RSA PEM format for openssl compatability
+	info "tpm2: reading endorsement key"
 	tpm2 createek >&2 \
 		--ek-context "$TMP/ek.ctx" \
 		--key-algorithm "rsa" \
@@ -100,8 +117,9 @@ quote()
 
 	tpm2_secret_session "$TMP/session.ctx"
 
-	warn "tpm2: creating ephemeral attestation key"
+	info "tpm2: creating ephemeral attestation key"
 	tpm2 create >&2 \
+		$QUIET \
 		--parent-context "$TMP/ek.ctx" \
 		--parent-auth "session:$TMP/session.ctx" \
 		--key-algorithm "ecc:ecdsa:null" \
@@ -113,6 +131,7 @@ quote()
 	# have to start a new secret session to load the attestation key
 	tpm2_secret_session "$TMP/session.ctx"
 	tpm2 load >&2 \
+		$QUIET \
 		--parent-context "$TMP/ek.ctx" \
 		--auth "session:$TMP/session.ctx" \
 		--key-context "$TMP/ak.ctx" \
@@ -121,8 +140,9 @@ quote()
 	|| die "tpm2_load: unable to load attestation key"
 
 	# read the public component so that the name can be
-	# computed with sha256
+	# computed with sha256 by the server
 	tpm2 readpublic >&2 \
+		$QUIET \
 		--object-context "$TMP/ak.ctx" \
 		--output "$TMP/ak.pub" \
 		--format "tpmt" \
@@ -139,8 +159,9 @@ quote()
 
 	# get a quote using this attestation key
 	tpm2_flushall ""
-	warn "tpm2: generating quote $QUOTE_NONCE"
+	info "tpm2: generating quote $QUOTE_NONCE"
 	tpm2 quote >&2 \
+		$QUIET \
 		--key-context "$TMP/ak.ctx" \
 		--pcr-list "sha256:$QUOTE_PCRS" \
 		--qualification "$QUOTE_NONCE" \
@@ -157,19 +178,23 @@ quote()
 	IMALOG="/sys/kernel/security/ima/ascii_runtime_measurements"
 
 	if [ -r "$EVENTLOG" ]; then
+		debug "attest: including eventlog $EVENTLOG"
+		QUOTE_FILES+=("eventlog")
 		cp \
 			"$EVENTLOG" \
 			"$TMP/eventlog" \
 		|| die "$EVENTLOG: unable to copy"
-		QUOTE_FILES+=("eventlog")
+	else
+		warn "eventlog $EVENTLOG not present"
 	fi
 
 	if [ -r "$IMALOG" ]; then
+		debug "attest: including imalog $IMALOG"
+		QUOTE_FILES+=("imalog")
 		cp \
 			"$IMALOG" \
 			"$TMP/imalog" \
 		|| die "$IMALOG: unable to copy"
-		QUOTE_FILES+=("imalog")
 	fi
 }
 
@@ -184,7 +209,10 @@ send_quote()
 		FORM_ARGS+=("--form" "$file=@$TMP/$file")
 	done
 
+	debug "tpm2: validating quote before sending"
+
 	tpm2 checkquote \
+		$QUIET \
 		--qualification "$(cat "$TMP/nonce")" \
 		--message "$TMP/quote" \
 		--signature "$TMP/sig" \
@@ -192,6 +220,8 @@ send_quote()
 		--public "$TMP/ak.pub" \
 		1>&2 \
 	|| warn "could not verify own quote. uh oh"
+
+	info "attest: sending quote to $SERVER"
 
 	curl \
 		-X POST \
@@ -219,16 +249,16 @@ unseal()
 {
 	REPLY="$1"
 
-	#set -x
-	#xxd -g1 "$REPLY"
-
-	tpm2_secret_session "$TMP/session.ctx"
+	info "attest: unsealing response"
 
 	dd if="$REPLY" of="$TMP/cred.blob" bs=16 skip=0 count=23 2>&-
 	dd if="$REPLY" of="$TMP/hmac.bin" bs=16 skip=23 count=2 2>&-
 	dd if="$REPLY" of="$TMP/cipher.bin" bs=16 skip=25 2>&-
 
+	tpm2_secret_session "$TMP/session.ctx"
+
 	tpm2 activatecredential \
+		$QUIET \
 		--credentialedkey-context "$TMP/ak.ctx" \
 		--credentialkey-context "$TMP/ek.ctx" \
 		--credentialkey-auth "session:$TMP/session.ctx" \
@@ -243,6 +273,8 @@ unseal()
 	dd if="$TMP/secret.key" bs=16 skip=3 count=1 of="$TMP/hmac.key" 2>&-
 
 	# validate the hmac on the reply
+	debug "openssl: validating reply"
+
 	openssl dgst \
 		-sha256 \
 		-binary \
@@ -258,6 +290,8 @@ unseal()
 
 	# hmac validated, so the encrypted data should be
 	# safe to decrypt with the session key, writing to stdout
+	debug "openssl: decrypting reply"
+
 	openssl enc \
 		-d \
 		-aes-256-cbc \
