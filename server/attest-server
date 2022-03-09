@@ -41,6 +41,167 @@ bindir = os.environ.get('BINDIR')
 if not bindir:
     bindir = '.'
 
+ak_type = "fixedtpm|stclear|fixedparent|sensitivedataorigin|userwithauth|restricted|sign"
+
+def validate_ak(ak_file):
+    sub = subprocess.run([
+	"tpm2", "print",
+	"--type", "TPMT_PUBLIC",
+	ak_file
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+      print("unable to parse AK")
+      return None
+
+    # The output contains YAML description of the attestation key
+    ak = yaml.safe_load(sub.stdout)
+    if not "attributes" in ak \
+    and not "value" in ak["attributes"]:
+      print("unable to parse AK")
+      return None
+
+    if ak["attributes"]["value"] != ak_type:
+      print("bad AK type", ak["attributes"]["value"])
+      return None
+
+    return ak
+
+
+def validate_quote(nonce,quote,sig,pcr,ak):
+    # use the tpm2 checkquote to validate the signature on the quote,
+    # the PCRs in the quote, and the one time nonce used for liveliness
+    # todo: use a signed nonce? timestamp?
+    sub = subprocess.run([
+	"tpm2", "checkquote",
+	"--qualification", nonce,
+	"--message",	quote,
+	"--signature",	sig,
+	"--pcr",	pcr,
+	"--public",	ak,
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+      return None
+
+    # The output contains YAML formatted list of PCRs
+    return yaml.safe_load(sub.stdout)
+
+def validate_eventlog(quote, eventlog_filename):
+    sub = subprocess.run([
+	"tpm2", "eventlog",
+	eventlog_filename,
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+    if sub.returncode != 0:
+      return None
+
+    eventlog = yaml.safe_load(sub.stdout)
+    if not "pcrs" in eventlog:
+      print("no PCRs in eventlog?")
+      return None
+
+    # validate that the eventlog pcrs match the quote pcrs
+    # note that an attacker might have removed some of the events;
+    # this only checks that the event log entries correspond to
+    # the resulting pcrs, but not that every pcr has eventlog entries.
+    for alg in quote["pcrs"]:
+      quote_pcrs = quote["pcrs"][alg]
+      if not alg in eventlog["pcrs"]:
+        print("no " + alg + " PCRs in eventlog?")
+        abort (403, "INVALID_EVENTLOG_ALG:" + alg)
+      eventlog_pcrs = eventlog["pcrs"][alg]
+
+      for pcr in quote_pcrs:
+        if not pcr in eventlog_pcrs:
+          # not an error; might have happened *after* the eventlog
+          # was closed by ExitBootServices
+          continue
+        ev = eventlog_pcrs[pcr];
+        qv = quote_pcrs[pcr]
+        if ev != qv:
+          print("inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
+          return None
+
+    return eventlog
+
+def verify_quote(ek_hash, tmpdir):
+    # now ask the verifier to
+    # process the eventlog and decide if the eventlog meets policy for
+    # this ekhash.
+    sub = subprocess.run([
+	bindir + "/attest-verify",
+	"verify",
+	ek_hash,
+	tmpdir
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+        print(ek_hash + ": attest-verify failed")
+        return Non
+
+    # read the (binary) response from the sub process stdout
+    reply = sub.stdout
+    return reply
+
+def seal_secret(secret, tmpdir, ak_hash, ek_filename):
+    # create an ephemeral session key, IV and HMAC key
+    aes_key = get_random_bytes(32)
+    aes_iv = get_random_bytes(16)
+    hmac_key = get_random_bytes(16)
+
+    # create the session key file that concatenates the
+    # AES key, IV and hmac key. 64-bytes is the maximum
+    # allowed with tpm2
+    secret_filename = os.path.join(tmpdir, "secret.bin")
+    with open(secret_filename, "wb") as f:
+      f.write(aes_key + aes_iv + hmac_key)
+
+    # and now seal it with the AK/EK into a credential blob
+    cred_filename = os.path.join(tmpdir, "credential.blob")
+    sub = subprocess.run([
+	"tpm2", "makecredential",
+	"--quiet",
+	"--tcti", "none",
+	"--secret", secret_filename,
+	"--encryption-key", ek_filename,
+	"--key-algorithm", "rsa",
+	"--name", "000b" + ak_hash,
+        "--credential-blob", cred_filename,
+    ],
+	stdout=subprocess.PIPE,
+	stderr=sys.stderr,
+    )
+
+    if sub.returncode != 0:
+      print(ek_hash + ": makecredential failed?", file=sys.stderr)
+      return None
+
+    # use the AES key and IV to encrypt the secret data
+    enc = AES.new(aes_key, AES.MODE_CBC, iv=aes_iv)
+    cipher = enc.encrypt(pad(secret, AES.block_size))
+
+    # compute the HMAC on the encrypted secret data
+    hmac = HMAC.new(key=hmac_key, msg=cipher, digestmod=SHA256).digest()
+
+    # append the hmac and cipher text to the cred file
+    with open(cred_filename, "ab") as f:
+      f.write(hmac)
+      f.write(cipher)
+
+    return cred_filename
+
 
 # The flask details;
 
@@ -53,6 +214,7 @@ def home_get():
 
 @app.route('/', methods=['POST'])
 def home_post():
+  try:
     # at a minimum there must be:
     required=('quote', 'sig', 'pcr', 'nonce', 'ak.pub', 'ek.pub')
 
@@ -71,154 +233,67 @@ def home_post():
     s = os.stat(tf.name)
     os.chmod(tf.name, s.st_mode | S_IROTH | S_IXOTH)
 
-    # save the required files into the directory
+    # store the required files in variables, as well as into the directory
     files = {}
     for f in required:
       files[f] = request.files[f].read()
       with open(os.path.join(tf.name, f), "wb") as fd:
         fd.write(files[f])
 
-    # re-read some of the files since save() makes them no longer available
+    ek_filename = os.path.join(tf.name, "ek.pub")
     ek_hash = SHA256.new(files["ek.pub"]).hexdigest()
     ak_hash = SHA256.new(files["ak.pub"]).hexdigest()
 
-    # TODO: check that the AK meets our requirements
+    # check that the AK meets our requirements
+    if not validate_ak(os.path.join(tf.name, "ak.pub")):
+      print(ek_hash + ": bad AK")
+      abort (403, "BAD_AK")
 
-    # use the tpm2 checkquote to validate the signature on the quote,
-    # the PCRs in the quote, and the one time nonce used for liveliness
-    # todo: use a signed nonce? timestamp?
-    sub = subprocess.run([
-	"tpm2", "checkquote",
-	"--qualification", files["nonce"],
-	"--message",	os.path.join(tf.name, "quote"),
-	"--signature",	os.path.join(tf.name, "sig"),
-	"--pcr",	os.path.join(tf.name, "pcr"),
-	"--public",	os.path.join(tf.name, "ak.pub"),
-    ],
-	stdout=subprocess.PIPE,
-	stderr=sys.stderr,
+    quote = validate_quote(
+	nonce		= files["nonce"],
+	quote		= os.path.join(tf.name, "quote"),
+	sig		= os.path.join(tf.name, "sig"),
+	pcr		= os.path.join(tf.name, "pcr"),
+	ak		= os.path.join(tf.name, "ak.pub"),
     )
-
-    if sub.returncode != 0:
-      print(ek_hash + ": invalid quote signature")
-      abort (403, "INVALID_QUOTE_SIGNATURE")
-
-    # The output contains YAML formatted list of PCRs
-    quote = yaml.safe_load(sub.stdout)
+    if not quote:
+      print(ek_hash + ": bad quote")
+      abort (403, "BAD_QUOTE")
 
     # verify that the eventlog, if present matches
-    eventlog = {}
-
     if "eventlog" not in request.files:
       # todo: allow server configuration for this
-      print(ek_hash + ": missing eventlog")
+      print(ek_hash + ": missing eventlog!")
       #abort (403, "MISSING_EVENTLOG")
     else:
       eventlog_filename = os.path.join(tf.name, "eventlog")
       request.files["eventlog"].save(eventlog_filename)
-      sub = subprocess.run([
-		"tpm2", "eventlog",
-		eventlog_filename,
-      ],
-	stdout=subprocess.PIPE,
-	stderr=sys.stderr,
-      )
-      if sub.returncode != 0:
-        print(ek_hash + ": invalid eventlog")
-        abort (403, "INVALID_EVENTLOG")
-
-      eventlog = yaml.safe_load(sub.stdout)
-      if not "pcrs" in eventlog:
-        print(ek_hash + ": no PCRs in eventlog?")
-        abort (403, "INVALID_EVENTLOG")
-
-      # validate that the eventlog pcrs match the quote pcrs
-      # note that an attacker might have removed some of the events;
-      # this only checks that the event log entries correspond to
-      # the resulting pcrs, but not that every pcr has eventlog entries.
-      for alg in quote["pcrs"]:
-        quote_pcrs = quote["pcrs"][alg]
-        if not alg in eventlog["pcrs"]:
-          print(ek_hash + ": no " + alg + " PCRs in eventlog?")
-          abort (403, "INVALID_EVENTLOG_ALG:" + alg)
-        eventlog_pcrs = eventlog["pcrs"][alg]
-
-        for pcr in quote_pcrs:
-          if not pcr in eventlog_pcrs:
-            # not an error; might have happened *after* the eventlog
-            # was closed by ExitBootServices
-            continue
-          ev = eventlog_pcrs[pcr];
-          qv = quote_pcrs[pcr]
-          if ev != qv:
-            print(ek_hash + ": inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
-            abort (403, "inconsistent " + alg + ":" + str(pcr) + "=" + qv + " != " + ev)
+      eventlog = valiate_eventlog(quote, eventlog_filename)
+      if not eventlog:
+        abort (403, "BAD_EVENTLOG")
 
     # the quote, eventlog and PCRS are consistent,
     print(ek_hash + ": valid quote and eventlog")
 
-    # now ask the verifier to
-    # process the eventlog and decide if the eventlog meets policy for
-    # this ekhash.
-    sub = subprocess.run([
-	bindir + "/attest-verify",
-	"verify",
-	ek_hash,
-	tf.name,
-    ],
-	stdout=subprocess.PIPE,
-	stderr=sys.stderr,
+    reply = verify_quote(ek_hash, tf.name)
+    print(ek_hash + ": attest_verify passed, %d bytes to send" % (len(reply)))
+
+    sealed_filename = seal_secret(
+	secret		= reply,
+	tmpdir		= tf.name,
+	ak_hash		= ak_hash,
+	ek_filename	= os.path.join(tf.name, "ek.pub"),
     )
 
-    if sub.returncode != 0:
-        print(ek_hash + ": attest-verify")
-        abort (403, "ATTEST_VERIFY FAILED")
+    print(ek_hash + ": sealed into", sealed_filename)
 
-    # read the (binary) response from the sub process stdout
-    reply = sub.stdout
+    if not sealed_filename:
+      print(ek_hash + ": secret sealing failed")
+      abort(500, "sealing failed")
 
-    print(ek_hash + ": attest verify passed, %d bytes to send" % (len(reply)))
-
-    # create an ephemeral session key, IV and HMAC key
-    aes_key = get_random_bytes(32)
-    aes_iv = get_random_bytes(16)
-    hmac_key = get_random_bytes(16)
-
-    secret_filename = os.path.join(tf.name, "secret.bin")
-    with open(secret_filename, "wb") as f:
-      f.write(aes_key + aes_iv + hmac_key)
-
-    # and now seal it with the AK/EK into a credential blob
-    cred_filename = os.path.join(tf.name, "credential.blob")
-    result = subprocess.run([
-	"tpm2", "makecredential",
-	"--tcti", "none",
-	"--secret", secret_filename,
-	"--encryption-key", os.path.join(tf.name, "ek.pub"),
-	"--name", "000b" + ak_hash,
-        "--credential-blob", cred_filename,
-    ],
-	stdout=subprocess.PIPE,
-	stderr=sys.stderr,
-    )
-
-    if sub.returncode != 0:
-      print(ek_hash + ": makecredential failed?")
-      return (500, "makecredential failed")
-
-    # and now encrypt the attestation result with the session key
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv=aes_iv)
-    ciphertext = cipher.encrypt(pad(reply, AES.block_size))
-
-    # compute the HMAC on the cleartext
-    hmac = HMAC.new(key=hmac_key, msg=reply, digestmod=SHA256).digest()
-
-    # append the hmac and cipher text to the cred file
-    with open(cred_filename, "ab") as f:
-      f.write(hmac)
-      f.write(ciphertext)
-
-    return send_file(cred_filename)
+    return send_file(sealed_filename)
+  except Exception as e:
+    print(e)
 
 if __name__ == "__main__":
     app.run()

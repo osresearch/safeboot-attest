@@ -76,6 +76,7 @@ quote()
 	tpm2 createek >&2 \
 		--ek-context "$TMP/ek.ctx" \
 		--key-algorithm "rsa" \
+		--format "PEM" \
 		--public "$TMP/ek.pub" \
 	|| die "tpm2_createek: unable to retrieve endorsement key"
 	QUOTE_FILES+=("ek.pub")
@@ -206,7 +207,7 @@ send_quote()
 # the file format that is returned is a simple concatenation of:
 #
 # 328 bytes tpm2 credential blob, containing 64 bytes of secret
-# 32 bytes of hmac
+# 32 bytes of hmac of the encrypted data
 # any number of bytes of data
 #
 # the unsealed secret has
@@ -241,15 +242,6 @@ unseal()
 	dd if="$TMP/secret.key" bs=16 skip=2 count=1 of="$TMP/aes.iv" 2>&-
 	dd if="$TMP/secret.key" bs=16 skip=3 count=1 of="$TMP/hmac.key" 2>&-
 
-	openssl enc \
-		-d \
-		-aes-256-cbc \
-		-iv "$(xxd -p -c128 "$TMP/aes.iv")" \
-		-K "$(xxd -p -c128 "$TMP/aes.key")" \
-		-in "$TMP/cipher.bin" \
-		-out "$TMP/reply.out" \
-	|| die "unable to decrypt reply"
-
 	# validate the hmac on the reply
 	openssl dgst \
 		-sha256 \
@@ -257,14 +249,22 @@ unseal()
 		-mac hmac \
 		-macopt hexkey:"$(xxd -p -c128 "$TMP/hmac.key")" \
 		-out "$TMP/hmac.out" \
-		"$TMP/reply.out" \
+		"$TMP/cipher.bin" \
 	|| die "unable to hmac reply"
 
 	if ! cmp --quiet "$TMP/hmac.out" "$TMP/hmac.bin" ; then
 		die "hmac failed"
 	fi
 
-	cat "$TMP/reply.out"
+	# hmac validated, so the encrypted data should be
+	# safe to decrypt with the session key, writing to stdout
+	openssl enc \
+		-d \
+		-aes-256-cbc \
+		-iv "$(xxd -p -c128 "$TMP/aes.iv")" \
+		-K "$(xxd -p -c128 "$TMP/aes.key")" \
+		-in "$TMP/cipher.bin" \
+	|| die "unable to decrypt reply"
 }
 
 
