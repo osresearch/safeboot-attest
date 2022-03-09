@@ -31,7 +31,10 @@ import tempfile
 import logging
 import yaml
 import hashlib
-from Crypto.Hash import SHA256
+from Crypto.Hash import SHA256, HMAC
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad
 
 
 bindir = os.environ.get('BINDIR')
@@ -79,6 +82,8 @@ def home_post():
     ek_hash = SHA256.new(files["ek.pub"]).hexdigest()
     ak_hash = SHA256.new(files["ak.pub"]).hexdigest()
 
+    # TODO: check that the AK meets our requirements
+
     # use the tpm2 checkquote to validate the signature on the quote,
     # the PCRs in the quote, and the one time nonce used for liveliness
     # todo: use a signed nonce? timestamp?
@@ -107,7 +112,7 @@ def home_post():
     if "eventlog" not in request.files:
       # todo: allow server configuration for this
       print(ek_hash + ": missing eventlog")
-      abort (403, "MISSING_EVENTLOG")
+      #abort (403, "MISSING_EVENTLOG")
     else:
       eventlog_filename = os.path.join(tf.name, "eventlog")
       request.files["eventlog"].save(eventlog_filename)
@@ -170,10 +175,18 @@ def home_post():
         abort (403, "ATTEST_VERIFY FAILED")
 
     # read the (binary) response from the sub process stdout
-    secret = sub.stdout
+    reply = sub.stdout
+
+    print(ek_hash + ": attest verify passed, %d bytes to send" % (len(reply)))
+
+    # create an ephemeral session key, IV and HMAC key
+    aes_key = get_random_bytes(32)
+    aes_iv = get_random_bytes(16)
+    hmac_key = get_random_bytes(16)
+
     secret_filename = os.path.join(tf.name, "secret.bin")
     with open(secret_filename, "wb") as f:
-      f.write(secret)
+      f.write(aes_key + aes_iv + hmac_key)
 
     # and now seal it with the AK/EK into a credential blob
     cred_filename = os.path.join(tf.name, "credential.blob")
@@ -192,6 +205,18 @@ def home_post():
     if sub.returncode != 0:
       print(ek_hash + ": makecredential failed?")
       return (500, "makecredential failed")
+
+    # and now encrypt the attestation result with the session key
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv=aes_iv)
+    ciphertext = cipher.encrypt(pad(reply, AES.block_size))
+
+    # compute the HMAC on the cleartext
+    hmac = HMAC.new(key=hmac_key, msg=reply, digestmod=SHA256).digest()
+
+    # append the hmac and cipher text to the cred file
+    with open(cred_filename, "ab") as f:
+      f.write(hmac)
+      f.write(ciphertext)
 
     return send_file(cred_filename)
 

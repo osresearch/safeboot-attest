@@ -1,4 +1,5 @@
 #!/bin/sh
 # place holder to just say hello!
 
-echo `date` hello
+#echo `date` hello
+perl -e 'print chr(ord("A") + ($_ % 26)) for 0..256'

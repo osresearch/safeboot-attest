@@ -4,8 +4,11 @@
 # This wraps the low level `tpm2-tools` programs into a fairly turn-key
 # remote attestation system to allow a client to use the TPM2 to prove to
 # a server that the PCRs are in a given state, and to then receive a
-# 32-byte sealed secret that can only be decrypted if the system is still in
+# sealed secret that can only be decrypted if the system is still in
 # that state.
+#
+# The external programs used are:
+# xxd, mktemp, tpm2, rm, date printf cp, curl, dd, openssl, cat
 #
 # For more info: https://safeboot.dev/attestation/
 #
@@ -200,25 +203,68 @@ send_quote()
 
 # credential.bin has a sealed secret for us
 # this assumes that the EK and AK are still present in $TMP
+# the file format that is returned is a simple concatenation of:
+#
+# 328 bytes tpm2 credential blob, containing 64 bytes of secret
+# 32 bytes of hmac
+# any number of bytes of data
+#
+# the unsealed secret has
+# 32 bytes of AES key
+# 16 bytes of AES IV
+# 16 bytes of HMAC key
+#
 unseal()
 {
-	CREDENTIAL="$1"
+	REPLY="$1"
 
-	xxd -g1 "$CREDENTIAL"
+	#set -x
+	#xxd -g1 "$REPLY"
 
 	tpm2_secret_session "$TMP/session.ctx"
+
+	dd if="$REPLY" of="$TMP/cred.blob" bs=16 skip=0 count=23 2>&-
+	dd if="$REPLY" of="$TMP/hmac.bin" bs=16 skip=23 count=2 2>&-
+	dd if="$REPLY" of="$TMP/cipher.bin" bs=16 skip=25 2>&-
 
 	tpm2 activatecredential \
 		--credentialedkey-context "$TMP/ak.ctx" \
 		--credentialkey-context "$TMP/ek.ctx" \
 		--credentialkey-auth "session:$TMP/session.ctx" \
-		--credential-blob "$CREDENTIAL" \
+		--credential-blob "$TMP/cred.blob" \
 		--certinfo-data "$TMP/secret.key" \
 		1>&2 \
 	|| die "tpm2_activatecredential: unable to unseal key"
 
-	cat "$TMP/secret.key"
-	rm -f "$TMP/secret.key"
+	# split the secret.key into AES key and IV,
+	dd if="$TMP/secret.key" bs=16 skip=0 count=2 of="$TMP/aes.key" 2>&-
+	dd if="$TMP/secret.key" bs=16 skip=2 count=1 of="$TMP/aes.iv" 2>&-
+	dd if="$TMP/secret.key" bs=16 skip=3 count=1 of="$TMP/hmac.key" 2>&-
+
+	openssl enc \
+		-d \
+		-aes-256-cbc \
+		-iv "$(xxd -p -c128 "$TMP/aes.iv")" \
+		-K "$(xxd -p -c128 "$TMP/aes.key")" \
+		-in "$TMP/cipher.bin" \
+		-out "$TMP/reply.out" \
+	|| die "unable to decrypt reply"
+
+	# validate the hmac on the reply
+	openssl dgst \
+		-sha256 \
+		-binary \
+		-mac hmac \
+		-macopt hexkey:"$(xxd -p -c128 "$TMP/hmac.key")" \
+		-out "$TMP/hmac.out" \
+		"$TMP/reply.out" \
+	|| die "unable to hmac reply"
+
+	if ! cmp --quiet "$TMP/hmac.out" "$TMP/hmac.bin" ; then
+		die "hmac failed"
+	fi
+
+	cat "$TMP/reply.out"
 }
 
 
