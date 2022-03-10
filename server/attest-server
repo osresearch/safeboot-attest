@@ -133,10 +133,11 @@ def validate_eventlog(quote, eventlog_filename):
 
     return eventlog
 
+# now ask the verifier to process the eventlog and decide
+# if the eventlog meets policy for this ekhash.
+# This is where the actual business logic happens; the other
+# steps have purely been validating the the quote is well formed, etc.
 def verify_quote(ek_hash, tmpdir):
-    # now ask the verifier to
-    # process the eventlog and decide if the eventlog meets policy for
-    # this ekhash.
     sub = subprocess.run([
 	bindir + "/attest-verify",
 	"verify",
@@ -149,11 +150,12 @@ def verify_quote(ek_hash, tmpdir):
 
     if sub.returncode != 0:
         print(ek_hash + ": attest-verify failed")
-        return Non
+        return None
 
     # read the (binary) response from the sub process stdout
     reply = sub.stdout
     return reply
+
 
 def seal_secret(secret, tmpdir, ak_hash, ek_filename):
     # create an ephemeral session key, IV and HMAC key
@@ -214,7 +216,7 @@ def home_get():
 
 @app.route('/', methods=['POST'])
 def home_post():
-  try:
+#  try:
     # at a minimum there must be:
     required=('quote', 'sig', 'pcr', 'nonce', 'ak.pub', 'ek.pub')
 
@@ -268,7 +270,7 @@ def home_post():
     else:
       eventlog_filename = os.path.join(tf.name, "eventlog")
       request.files["eventlog"].save(eventlog_filename)
-      eventlog = valiate_eventlog(quote, eventlog_filename)
+      eventlog = validate_eventlog(quote, eventlog_filename)
       if not eventlog:
         abort (403, "BAD_EVENTLOG")
 
@@ -276,6 +278,9 @@ def home_post():
     print(ek_hash + ": valid quote and eventlog")
 
     reply = verify_quote(ek_hash, tf.name)
+    if not reply:
+        abort(403, "verify failed")
+
     print(ek_hash + ": attest_verify passed, %d bytes to send" % (len(reply)))
 
     sealed_filename = seal_secret(
@@ -292,8 +297,8 @@ def home_post():
       abort(500, "sealing failed")
 
     return send_file(sealed_filename)
-  except Exception as e:
-    print(e)
+#  except Exception as e:
+#    print(e)
 
 if __name__ == "__main__":
     app.run()
