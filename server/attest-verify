@@ -1,5 +1,15 @@
 #!/bin/sh
 # place holder to just say hello!
+# it sends a tar file containing the contents of the directory
+# that matches the EK hash
 
-#echo `date` hello
-perl -e 'print chr(ord("A") + ($_ % 26)) for 0..256'
+cmd="$1"  # should be verify
+ekhash="$2"
+tmpdir="$3"
+
+if [ ! -d "db/$ekhash" ]; then
+	echo >&2 "$ekhash: not in database"
+	exit 1
+fi
+
+tar -zcvf - -C "db/$ekhash" .
